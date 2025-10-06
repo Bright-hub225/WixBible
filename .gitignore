@@ -1,0 +1,4 @@
+node_modules
+.env
+# Optional: if you don't want to push eden_lite.db to GitHub
+eden_lite.db

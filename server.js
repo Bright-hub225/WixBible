@@ -32,6 +32,7 @@ app.get("/", (req, res) => {
       "/api/books",
       "/api/chapters/:bookId",
       "/api/verses/:bookId/:chapter",
+      "/api/verses/:bookId (returns chapters)",
       "/api/nav/book/:bookId",
       "/api/nav/chapter/:bookId/:chapter",
       "/api/search?q=...",
@@ -51,9 +52,58 @@ async function start() {
       driver: sqlite3.Database
     });
 
+    // Make DB more resilient to locks and concurrent reads/writes
+    try {
+      await db.exec("PRAGMA busy_timeout = 5000;");
+      await db.exec("PRAGMA journal_mode = WAL;");
+      console.log("Applied PRAGMA busy_timeout=5000 and journal_mode=WAL");
+    } catch (e) {
+      console.warn("PRAGMA setup failed:", e);
+    }
+
     // quick sanity log: list tables (helpful in logs)
     const tables = await db.all("SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name");
     console.log("DB tables/views:", tables.map(t => t.name));
+
+    // -------------------------
+    // Helper: resolve book identifiers (numeric id, code, or name)
+    // -------------------------
+    async function resolveBookId(input) {
+      if (!input) return null;
+      // normalize
+      const raw = String(input).trim();
+
+      // try numeric book_id first (match exact)
+      if (/^\d+$/.test(raw)) {
+        const byId = await db.get(`SELECT book_id FROM books WHERE book_id = ?`, [Number(raw)]);
+        if (byId) return String(byId.book_id);
+      }
+
+      // try code exact match
+      const byCode = await db.get(`SELECT book_id FROM books WHERE code = ?`, [raw]);
+      if (byCode) return String(byCode.book_id);
+
+      // try case-insensitive name match
+      const byName = await db.get(`SELECT book_id FROM books WHERE LOWER(name) = LOWER(?)`, [raw]);
+      if (byName) return String(byName.book_id);
+
+      // try prefix match (e.g., "john" matches "John")
+      const byLike = await db.get(`SELECT book_id FROM books WHERE LOWER(name) LIKE LOWER(?)`, [raw + '%']);
+      if (byLike) return String(byLike.book_id);
+
+      // try contains anywhere
+      const byLikeAnywhere = await db.get(`SELECT book_id FROM books WHERE LOWER(name) LIKE LOWER(?)`, ['%' + raw + '%']);
+      if (byLikeAnywhere) return String(byLikeAnywhere.book_id);
+
+      // last ditch numeric parse
+      const maybeNum = Number(raw);
+      if (!Number.isNaN(maybeNum)) {
+        const byId2 = await db.get(`SELECT book_id FROM books WHERE book_id = ?`, [maybeNum]);
+        if (byId2) return String(byId2.book_id);
+      }
+
+      return null;
+    }
 
     // -------------------------
     // Routes used by the frontend
@@ -73,32 +123,127 @@ async function start() {
       }
     });
 
-    // GET /api/chapters/:bookId
+    // GET /api/chapters/:bookId  (resolves book identifier flexibly)
     app.get("/api/chapters/:bookId", async (req, res) => {
-      const { bookId } = req.params;
       try {
-        const rows = await db.all(`SELECT DISTINCT chapter FROM verses WHERE book_id = ? ORDER BY chapter`, [bookId]);
-        return res.json(rows.map(r => r.chapter));
+        const raw = req.params.bookId;
+        const bookId = await resolveBookId(raw);
+        if (!bookId) return res.json([]); // unknown book
+
+        // try canonical views first, then fallback to verses
+        const sources = [
+          { sql: `SELECT DISTINCT chapter FROM verses_api WHERE book_id = ? ORDER BY chapter`, args: [bookId] },
+          { sql: `SELECT DISTINCT chapter FROM verses_with_book WHERE book_id = ? ORDER BY chapter`, args: [bookId] },
+          { sql: `SELECT DISTINCT chapter FROM verses WHERE book_id = ? ORDER BY chapter`, args: [bookId] }
+        ];
+
+        for (const s of sources) {
+          try {
+            const rows = await db.all(s.sql, s.args);
+            if (rows && rows.length) return res.json(rows.map(r => r.chapter));
+          } catch (e) {
+            // ignore and try next
+            console.warn("chapters: source query failed:", e.message);
+          }
+        }
+
+        return res.json([]);
       } catch (err) {
         console.error("GET /api/chapters error:", err);
         res.status(500).json({ error: err.message });
       }
     });
 
-    // GET /api/verses/:bookId/:chapter
+    // -------------------------
+    // REPLACED: Robust verses route that tries views and falls back safely
+    // -------------------------
     app.get("/api/verses/:bookId/:chapter", async (req, res) => {
-      const { bookId, chapter } = req.params;
       try {
-        const rows = await db.all(
-          `SELECT id, verse, COALESCE(text_plain, text) AS text
-           FROM verses
-           WHERE book_id = ? AND chapter = ?
-           ORDER BY verse ASC`,
-          [bookId, chapter]
-        );
-        res.json(rows);
+        const raw = req.params.bookId;
+        const chapter = req.params.chapter;
+        const bookId = await resolveBookId(raw);
+        console.log("[DEBUG] verses.resolveBookId(", raw, ") ->", bookId);
+        if (!bookId) return res.status(404).json({ error: "Book not found", input: raw });
+
+        // 1) try verses_api (likely the canonical view)
+        try {
+          const rowsApi = await db.all(
+            `SELECT id, verse, COALESCE(text_plain, text, '') AS text
+             FROM verses_api
+             WHERE book_id = ? AND chapter = ?
+             ORDER BY verse ASC`,
+            [bookId, chapter]
+          );
+          if (rowsApi && rowsApi.length) return res.json(rowsApi);
+        } catch (e) {
+          console.warn("verses_api query failed:", e.message);
+        }
+
+        // 2) try verses_with_book view
+        try {
+          const rowsW = await db.all(
+            `SELECT id, verse, COALESCE(text_plain, text, '') AS text
+             FROM verses_with_book
+             WHERE book_id = ? AND chapter = ?
+             ORDER BY verse ASC`,
+            [bookId, chapter]
+          );
+          if (rowsW && rowsW.length) return res.json(rowsW);
+        } catch (e) {
+          console.warn("verses_with_book query failed:", e.message);
+        }
+
+        // 3) fallback to verses with a VERY safe select
+        try {
+          // we explicitly avoid referencing any unknown "text" column name here
+          const rows = await db.all(
+            `SELECT id, verse, COALESCE(text_plain, '') AS text
+             FROM verses
+             WHERE book_id = ? AND chapter = ?
+             ORDER BY verse ASC`,
+            [bookId, chapter]
+          );
+          return res.json(rows || []);
+        } catch (e) {
+          console.warn("verses query failed:", e.message);
+        }
+
+        // nothing found
+        return res.json([]);
       } catch (err) {
         console.error("GET /api/verses error:", err);
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // -------------------------
+    // NEW: convenience route: GET /api/verses/:bookId  -> returns chapters for that book
+    // This is API-friendly and returns a JSON array of chapter numbers.
+    // -------------------------
+    app.get("/api/verses/:bookId", async (req, res) => {
+      try {
+        const raw = req.params.bookId;
+        const bookId = await resolveBookId(raw);
+        if (!bookId) return res.status(404).json({ error: "Book not found", input: raw });
+
+        const sources = [
+          { sql: `SELECT DISTINCT chapter FROM verses_api WHERE book_id = ? ORDER BY chapter`, args: [bookId] },
+          { sql: `SELECT DISTINCT chapter FROM verses_with_book WHERE book_id = ? ORDER BY chapter`, args: [bookId] },
+          { sql: `SELECT DISTINCT chapter FROM verses WHERE book_id = ? ORDER BY chapter`, args: [bookId] }
+        ];
+
+        for (const s of sources) {
+          try {
+            const rows = await db.all(s.sql, s.args);
+            if (rows && rows.length) return res.json(rows.map(r => r.chapter));
+          } catch (e) {
+            console.warn("verses(:bookId) chapters source failed:", e.message);
+          }
+        }
+
+        return res.json([]);
+      } catch (err) {
+        console.error("GET /api/verses/:bookId chapters error:", err);
         res.status(500).json({ error: err.message });
       }
     });
@@ -167,12 +312,11 @@ async function start() {
       }
     });
 
-    // GET /api/search?q=...
+    // GET /api/search?q=...  (search text_plain using FTS if present, otherwise LIKE)
     app.get("/api/search", async (req, res) => {
       const q = (req.query.q || "").trim();
       if (!q) return res.json([]);
       try {
-        // detect fts table
         const ftsExists = (await db.get(`SELECT name FROM sqlite_master WHERE type='table' AND name='verses_fts'`)) !== undefined;
         if (ftsExists) {
           const rows = await db.all(
@@ -187,7 +331,7 @@ async function start() {
           const rows = await db.all(
             `SELECT book_id AS book, chapter, verse, text_plain AS text
              FROM verses
-             WHERE text_plain LIKE '%' || ? || '%'
+             WHERE LOWER(text_plain) LIKE '%' || LOWER(?) || '%'
              LIMIT 200`,
             [q]
           );

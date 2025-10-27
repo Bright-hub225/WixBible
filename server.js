@@ -7,44 +7,71 @@ import compression from "compression";
 import path from "path";
 import { fileURLToPath } from "url";
 
+// --- sanitize verse text for plain output ---
+// Removes pilcrow (¶), collapses multiple whitespace, trims.
+// If you want to strip editorial [bracketed] words, uncomment the .replace(...) line.
+function sanitizeText(s) {
+  if (!s) return "";
+  return String(s)
+    .replace(/¶/g, "")            // remove pilcrow
+    //.replace(/\[.*?\]/g, "")    // optional: remove bracketed words
+    .replace(/\u00A0/g, " ")      // non-breaking space
+    .replace(/\s+/g, " ")         // collapse multiple spaces/newlines
+    .trim();
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DB_PATH = path.join(__dirname, "eden_lite.db");
 const PORT = process.env.PORT || 3000;
 
 const app = express();
-app.use(cors()); // allow all origins by default (restrict in production if needed)
+app.use(cors());
 app.use(compression());
 app.use(express.json());
 
-// simple request logger to help diagnose on Render
+// simple request logger
 app.use((req, res, next) => {
   console.log(`[REQ] ${req.method} ${req.path}`);
   next();
 });
 
-// health / root route
-app.get("/", (req, res) => {
-  res.json({
-    message: "Eden Bible API — healthy",
-    note: "Use /api/* endpoints",
-    endpoints: [
-      "/api/books",
-      "/api/chapters/:bookId",
-      "/api/verses/:bookId/:chapter",
-      "/api/verses/:bookId (returns chapters)",
-      "/api/nav/book/:bookId",
-      "/api/nav/chapter/:bookId/:chapter",
-      "/api/search?q=...",
-      "/api/tokens/:verseId",
-      "/api/lexicon/:strong",
-      "/api/comments"
-    ]
-  });
-});
+let db; // global DB handle
 
-let db; // global handle
+// Helper: normalized expression for whole-word matching
+// (replaces common punctuation/newlines with spaces, lowercases, and pads with spaces)
+function normalizedColumnExpr(colName) {
+  return `
+    LOWER(
+      ' ' ||
+      REPLACE(
+        REPLACE(
+          REPLACE(
+            REPLACE(
+              REPLACE(
+                REPLACE(
+                  REPLACE(
+                    REPLACE(
+                      REPLACE(
+                        REPLACE(
+                          REPLACE(${colName},
+                            CHAR(10), ' '),
+                          CHAR(13), ' '),
+                        CHAR(9), ' '),
+                      '\r', ' '),
+                    '\n', ' '),
+                  '.', ' '),
+                ',', ' '),
+              ';', ' '),
+            ':', ' '),
+          '!', ' '),
+        '?', ' '),
+      '(', ' ')
+    )
+  `;
+}
 
+// Start server and open DB
 async function start() {
   try {
     db = await open({
@@ -52,7 +79,7 @@ async function start() {
       driver: sqlite3.Database
     });
 
-    // Make DB more resilient to locks and concurrent reads/writes
+    // PRAGMA for resilience
     try {
       await db.exec("PRAGMA busy_timeout = 5000;");
       await db.exec("PRAGMA journal_mode = WAL;");
@@ -61,7 +88,7 @@ async function start() {
       console.warn("PRAGMA setup failed:", e);
     }
 
-    // quick sanity log: list tables (helpful in logs)
+    // quick sanity
     const tables = await db.all("SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name");
     console.log("DB tables/views:", tables.map(t => t.name));
 
@@ -70,28 +97,27 @@ async function start() {
     // -------------------------
     async function resolveBookId(input) {
       if (!input) return null;
-      // normalize
       const raw = String(input).trim();
 
-      // try numeric book_id first (match exact)
+      // numeric
       if (/^\d+$/.test(raw)) {
         const byId = await db.get(`SELECT book_id FROM books WHERE book_id = ?`, [Number(raw)]);
         if (byId) return String(byId.book_id);
       }
 
-      // try code exact match
+      // code exact
       const byCode = await db.get(`SELECT book_id FROM books WHERE code = ?`, [raw]);
       if (byCode) return String(byCode.book_id);
 
-      // try case-insensitive name match
+      // case-insensitive exact name
       const byName = await db.get(`SELECT book_id FROM books WHERE LOWER(name) = LOWER(?)`, [raw]);
       if (byName) return String(byName.book_id);
 
-      // try prefix match (e.g., "john" matches "John")
+      // prefix match
       const byLike = await db.get(`SELECT book_id FROM books WHERE LOWER(name) LIKE LOWER(?)`, [raw + '%']);
       if (byLike) return String(byLike.book_id);
 
-      // try contains anywhere
+      // contains anywhere
       const byLikeAnywhere = await db.get(`SELECT book_id FROM books WHERE LOWER(name) LIKE LOWER(?)`, ['%' + raw + '%']);
       if (byLikeAnywhere) return String(byLikeAnywhere.book_id);
 
@@ -106,13 +132,36 @@ async function start() {
     }
 
     // -------------------------
-    // Routes used by the frontend
+    // Root / health route
     // -------------------------
+    app.get("/", (req, res) => {
+      res.json({
+        message: "Eden Bible API — healthy",
+        note: "Use /api/* endpoints",
+        endpoints: [
+          "/api/books",
+          "/api/chapters/:bookId",
+          "/api/verses/:bookId/:chapter",
+          "/api/verses/:bookId (returns chapters)",
+          "/api/verses/plain/:bookId/:chapter (plain text)",
+          "/api/verse/plain/:bookId/:chapter/:verse (plain verse)",
+          "/api/nav/book/:bookId",
+          "/api/nav/chapter/:bookId/:chapter",
+          "/api/nav/verse/:bookId/:chapter/:verse",
+          "/api/search?q=...",
+          "/api/search/plain?q=...&exact=1",
+          "/api/tokens/:verseId",
+          "/api/lexicon/:strong",
+          "/api/comments"
+        ]
+      });
+    });
 
+    // -------------------------
     // GET /api/books
+    // -------------------------
     app.get("/api/books", async (req, res) => {
       try {
-        // try numeric order if book_id numeric, else fallback to name
         const rows = await db.all(`SELECT book_id AS id, code, name FROM books ORDER BY CAST(book_id AS INTEGER)`);
         if (rows && rows.length) return res.json(rows);
         const alt = await db.all(`SELECT book_id AS id, code, name FROM books ORDER BY name`);
@@ -123,14 +172,15 @@ async function start() {
       }
     });
 
+    // -------------------------
     // GET /api/chapters/:bookId  (resolves book identifier flexibly)
+    // -------------------------
     app.get("/api/chapters/:bookId", async (req, res) => {
       try {
         const raw = req.params.bookId;
         const bookId = await resolveBookId(raw);
-        if (!bookId) return res.json([]); // unknown book
+        if (!bookId) return res.json([]);
 
-        // try canonical views first, then fallback to verses
         const sources = [
           { sql: `SELECT DISTINCT chapter FROM verses_api WHERE book_id = ? ORDER BY chapter`, args: [bookId] },
           { sql: `SELECT DISTINCT chapter FROM verses_with_book WHERE book_id = ? ORDER BY chapter`, args: [bookId] },
@@ -142,7 +192,6 @@ async function start() {
             const rows = await db.all(s.sql, s.args);
             if (rows && rows.length) return res.json(rows.map(r => r.chapter));
           } catch (e) {
-            // ignore and try next
             console.warn("chapters: source query failed:", e.message);
           }
         }
@@ -155,7 +204,8 @@ async function start() {
     });
 
     // -------------------------
-    // REPLACED: Robust verses route that tries views and falls back safely
+    // JSON verses route (existing, returns JSON array of {id, verse, text})
+    // GET /api/verses/:bookId/:chapter
     // -------------------------
     app.get("/api/verses/:bookId/:chapter", async (req, res) => {
       try {
@@ -165,7 +215,7 @@ async function start() {
         console.log("[DEBUG] verses.resolveBookId(", raw, ") ->", bookId);
         if (!bookId) return res.status(404).json({ error: "Book not found", input: raw });
 
-        // 1) try verses_api (likely the canonical view)
+        // try verses_api, then verses_with_book, then verses
         try {
           const rowsApi = await db.all(
             `SELECT id, verse, COALESCE(text_plain, text, '') AS text
@@ -179,7 +229,6 @@ async function start() {
           console.warn("verses_api query failed:", e.message);
         }
 
-        // 2) try verses_with_book view
         try {
           const rowsW = await db.all(
             `SELECT id, verse, COALESCE(text_plain, text, '') AS text
@@ -193,9 +242,7 @@ async function start() {
           console.warn("verses_with_book query failed:", e.message);
         }
 
-        // 3) fallback to verses with a VERY safe select
         try {
-          // we explicitly avoid referencing any unknown "text" column name here
           const rows = await db.all(
             `SELECT id, verse, COALESCE(text_plain, '') AS text
              FROM verses
@@ -208,7 +255,6 @@ async function start() {
           console.warn("verses query failed:", e.message);
         }
 
-        // nothing found
         return res.json([]);
       } catch (err) {
         console.error("GET /api/verses error:", err);
@@ -217,8 +263,7 @@ async function start() {
     });
 
     // -------------------------
-    // NEW: convenience route: GET /api/verses/:bookId  -> returns chapters for that book
-    // This is API-friendly and returns a JSON array of chapter numbers.
+    // GET /api/verses/:bookId  -> returns chapters for that book (JSON)
     // -------------------------
     app.get("/api/verses/:bookId", async (req, res) => {
       try {
@@ -248,11 +293,12 @@ async function start() {
       }
     });
 
+    // -------------------------
     // GET nav/book/:bookId  (prev/next book)
+    // -------------------------
     app.get("/api/nav/book/:bookId", async (req, res) => {
       const { bookId } = req.params;
       try {
-        // fetch books ordered (try numeric order)
         let orderRows = await db.all(`SELECT book_id, name FROM books ORDER BY CAST(book_id AS INTEGER)`);
         if (!orderRows || orderRows.length === 0) {
           orderRows = await db.all(`SELECT book_id, name FROM books ORDER BY name`);
@@ -267,13 +313,13 @@ async function start() {
       }
     });
 
+    // -------------------------
     // GET nav/chapter/:bookId/:chapter  (prev/next chapter)
+    // -------------------------
     app.get("/api/nav/chapter/:bookId/:chapter", async (req, res) => {
       const { bookId, chapter } = req.params;
       try {
-        // prev in same book
         const prevRow = await db.get(`SELECT MAX(chapter) AS chapter FROM verses WHERE book_id = ? AND chapter < ?`, [bookId, chapter]);
-        // next in same book
         const nextRow = await db.get(`SELECT MIN(chapter) AS chapter FROM verses WHERE book_id = ? AND chapter > ?`, [bookId, chapter]);
 
         let prev = null;
@@ -282,7 +328,6 @@ async function start() {
         if (prevRow && prevRow.chapter !== null) {
           prev = { bookId, chapter: prevRow.chapter };
         } else {
-          // previous book's last chapter
           const books = await db.all(`SELECT book_id FROM books ORDER BY CAST(book_id AS INTEGER)`);
           const idx = books.findIndex(b => String(b.book_id) === String(bookId));
           if (idx > 0) {
@@ -295,7 +340,6 @@ async function start() {
         if (nextRow && nextRow.chapter !== null) {
           next = { bookId, chapter: nextRow.chapter };
         } else {
-          // next book's first chapter
           const books = await db.all(`SELECT book_id FROM books ORDER BY CAST(book_id AS INTEGER)`);
           const idx = books.findIndex(b => String(b.book_id) === String(bookId));
           if (idx >= 0 && idx < books.length - 1) {
@@ -312,7 +356,11 @@ async function start() {
       }
     });
 
-    // GET /api/search?q=...  (search text_plain using FTS if present, otherwise LIKE)
+    // -------------------------
+    // JSON search (keeps your existing behaviour)
+    // GET /api/search?q=...
+    // Uses FTS if present, otherwise LIKE
+    // -------------------------
     app.get("/api/search", async (req, res) => {
       const q = (req.query.q || "").trim();
       if (!q) return res.json([]);
@@ -343,7 +391,9 @@ async function start() {
       }
     });
 
-    // GET /api/tokens/:verseId
+    // -------------------------
+    // Tokens and lexicon endpoints (unchanged)
+    // -------------------------
     app.get("/api/tokens/:verseId", async (req, res) => {
       const { verseId } = req.params;
       try {
@@ -361,7 +411,6 @@ async function start() {
       }
     });
 
-    // GET /api/lexicon/:strong
     app.get("/api/lexicon/:strong", async (req, res) => {
       const strong = req.params.strong;
       try {
@@ -376,7 +425,9 @@ async function start() {
       }
     });
 
-    // Comments: GET
+    // -------------------------
+    // Comments GET and POST (unchanged)
+    // -------------------------
     app.get("/api/comments", async (req, res) => {
       const { bookId, chapter, verse } = req.query;
       if (!bookId || !chapter || !verse) return res.status(400).json({ error: "Provide bookId, chapter, verse" });
@@ -392,7 +443,6 @@ async function start() {
       }
     });
 
-    // Comments: POST
     app.post("/api/comments", async (req, res) => {
       const { bookId, chapter, verse, author, body } = req.body || {};
       if (!bookId || !chapter || !verse || !body) return res.status(400).json({ error: "Missing fields" });
@@ -409,14 +459,250 @@ async function start() {
       }
     });
 
-    // Fallback 404 to return JSON (helps debugging)
+    // -------------------------
+    // Plain-text chapter (robust)
+    // GET /api/verses/plain/:bookId/:chapter
+    // -------------------------
+    app.get("/api/verses/plain/:bookId/:chapter", async (req, res) => {
+      try {
+        const raw = req.params.bookId;
+        const chapter = req.params.chapter;
+        const bookId = await resolveBookId(raw);
+        if (!bookId) return res.status(404).type("text/plain").send("");
+
+        let rows = [];
+
+        // try verses_api but gracefully handle errors and fallback to verses
+        const hasVersesApi = (await db.get(`SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name='verses_api'`)) !== undefined;
+        if (hasVersesApi) {
+          try {
+            rows = await db.all(
+              `SELECT verse, COALESCE(text_plain, text, '') AS text
+               FROM verses_api
+               WHERE book_id = ? AND chapter = ?
+               ORDER BY verse ASC`,
+              [bookId, chapter]
+            );
+          } catch (e) {
+            console.warn("verses_api query failed (plain route):", e.message);
+            rows = [];
+          }
+        }
+
+        // fallback to verses if verses_api missing or returned nothing
+        if (!rows || rows.length === 0) {
+          try {
+            rows = await db.all(
+              `SELECT verse, COALESCE(text_plain, '') AS text
+               FROM verses
+               WHERE book_id = ? AND chapter = ?
+               ORDER BY verse ASC`,
+              [bookId, chapter]
+            );
+          } catch (e) {
+            console.warn("verses query failed (plain route):", e.message);
+            rows = [];
+          }
+        }
+
+        if (!rows || rows.length === 0) {
+          // nothing found: return empty plain text
+          return res.type("text/plain").send("");
+        }
+
+        const out = rows.map(r => `${r.verse}. ${r.text.trim()}`).join("\n");
+        res.type("text/plain").send(out);
+      } catch (err) {
+        console.error("GET /api/verses/plain error:", err);
+        res.status(500).type("text/plain").send("");
+      }
+    });
+
+    // -------------------------
+    // Plain-text single verse (robust)
+    // GET /api/verse/plain/:bookId/:chapter/:verse
+    // -------------------------
+    app.get("/api/verse/plain/:bookId/:chapter/:verse", async (req, res) => {
+      try {
+        const raw = req.params.bookId;
+        const chapter = req.params.chapter;
+        const verse = req.params.verse;
+        const bookId = await resolveBookId(raw);
+        if (!bookId) return res.status(404).type("text/plain").send("");
+
+        let row = null;
+        const hasVersesApi = (await db.get(`SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name='verses_api'`)) !== undefined;
+
+        if (hasVersesApi) {
+          try {
+            row = await db.get(
+              `SELECT v.book_id, v.chapter, v.verse, COALESCE(v.text_plain, v.text, '') AS text, b.name AS book
+               FROM verses_api v
+               JOIN books b ON b.book_id = v.book_id
+               WHERE v.book_id = ? AND v.chapter = ? AND v.verse = ? LIMIT 1`,
+              [bookId, chapter, verse]
+            );
+          } catch (e) {
+            console.warn("verses_api single-verse query failed (plain route):", e.message);
+            row = null;
+          }
+        }
+
+        // fallback to verses if verses_api missing or failed
+        if (!row) {
+          try {
+            row = await db.get(
+              `SELECT v.book_id, v.chapter, v.verse, COALESCE(v.text_plain, '') AS text, b.name AS book
+               FROM verses v
+               JOIN books b ON b.book_id = v.book_id
+               WHERE v.book_id = ? AND v.chapter = ? AND v.verse = ? LIMIT 1`,
+              [bookId, chapter, verse]
+            );
+          } catch (e) {
+            console.warn("verses single-verse query failed (plain route):", e.message);
+            row = null;
+          }
+        }
+
+        if (!row) return res.status(404).type("text/plain").send("");
+
+        res.type("text/plain").send(`${row.verse}. ${row.text.trim()}`);
+      } catch (err) {
+        console.error("GET /api/verse/plain error:", err);
+        res.status(500).type("text/plain").send("");
+      }
+    });
+
+    // -------------------------
+// FIXED plain-text search route with exact and fuzzy match
+// GET /api/search/plain?q=word&exact=1
+// returns "Genesis 1:1. In the beginning..."
+app.get("/api/search/plain", async (req, res) => {
+  try {
+    const q = (req.query.q || "").trim();
+    if (!q) return res.type("text/plain").send("");
+
+    const exact = req.query.exact === "1" || req.query.exact === "true";
+
+    // prefer main verses table
+    const table = "verses";
+    const textColumn = "text_plain";
+
+    let rows = [];
+
+    if (exact) {
+      // Whole-word (normalized) search
+      const normExpr = normalizedColumnExpr(`v.${textColumn}`);
+      const pattern = `% ${q.toLowerCase()} %`;
+      rows = await db.all(
+        `
+        SELECT b.name AS book, v.chapter, v.verse, COALESCE(v.${textColumn}, '') AS text
+        FROM ${table} v
+        JOIN books b ON b.book_id = v.book_id
+        WHERE ${normExpr} LIKE ?
+        LIMIT 500;
+        `,
+        [pattern]
+      );
+    } else {
+      // Normal substring match
+      rows = await db.all(
+        `
+        SELECT b.name AS book, v.chapter, v.verse, COALESCE(v.${textColumn}, '') AS text
+        FROM ${table} v
+        JOIN books b ON b.book_id = v.book_id
+        WHERE LOWER(v.${textColumn}) LIKE '%' || LOWER(?) || '%'
+        LIMIT 500;
+        `,
+        [q]
+      );
+    }
+
+    if (!rows || rows.length === 0) {
+      return res.type("text/plain").send("No results found.");
+    }
+
+    // Format and sanitize results
+    const out = rows
+      .map(r => `${r.book} ${r.chapter}:${r.verse}. ${sanitizeText(r.text)}`)
+      .join("\n");
+
+    res.type("text/plain").send(out);
+
+    } catch (err) {
+    console.error("GET /api/search/plain error:", err.message);
+    console.error(err.stack);
+    res.status(500).type("text/plain").send("Error performing search: " + err.message);
+  }
+});
+
+    // -------------------------
+    // Navigation helper for next/previous verse coordinates
+    // GET /api/nav/verse/:bookId/:chapter/:verse
+    // -------------------------
+    app.get("/api/nav/verse/:bookId/:chapter/:verse", async (req, res) => {
+      try {
+        const { bookId: raw, chapter, verse } = req.params;
+        const bookId = await resolveBookId(raw);
+        if (!bookId) return res.status(404).json({ error: "Book not found" });
+
+        const nextSame = await db.get(
+          `SELECT verse FROM verses WHERE book_id = ? AND chapter = ? AND verse > ? ORDER BY verse ASC LIMIT 1`,
+          [bookId, chapter, verse]
+        );
+
+        const prevSame = await db.get(
+          `SELECT verse FROM verses WHERE book_id = ? AND chapter = ? AND verse < ? ORDER BY verse DESC LIMIT 1`,
+          [bookId, chapter, verse]
+        );
+
+        let next = null, prev = null;
+
+        if (nextSame) {
+          next = { bookId, chapter, verse: nextSame.verse };
+        } else {
+          const books = await db.all(`SELECT book_id FROM books ORDER BY CAST(book_id AS INTEGER)`);
+          const idx = books.findIndex(b => String(b.book_id) === String(bookId));
+          if (idx >= 0 && idx < books.length - 1) {
+            const nextBook = books[idx + 1].book_id;
+            const nextChap = await db.get(`SELECT MIN(chapter) AS chapter FROM verses WHERE book_id = ?`, [nextBook]);
+            if (nextChap && nextChap.chapter !== null) {
+              const firstVerse = await db.get(`SELECT MIN(verse) AS verse FROM verses WHERE book_id = ? AND chapter = ?`, [nextBook, nextChap.chapter]);
+              if (firstVerse) next = { bookId: nextBook, chapter: nextChap.chapter, verse: firstVerse.verse };
+            }
+          }
+        }
+
+        if (prevSame) {
+          prev = { bookId, chapter, verse: prevSame.verse };
+        } else {
+          const books = await db.all(`SELECT book_id FROM books ORDER BY CAST(book_id AS INTEGER)`);
+          const idx = books.findIndex(b => String(b.book_id) === String(bookId));
+          if (idx > 0) {
+            const prevBook = books[idx - 1].book_id;
+            const prevChap = await db.get(`SELECT MAX(chapter) AS chapter FROM verses WHERE book_id = ?`, [prevBook]);
+            if (prevChap && prevChap.chapter !== null) {
+              const lastVerse = await db.get(`SELECT MAX(verse) AS verse FROM verses WHERE book_id = ? AND chapter = ?`, [prevBook, prevChap.chapter]);
+              if (lastVerse) prev = { bookId: prevBook, chapter: prevChap.chapter, verse: lastVerse.verse };
+            }
+          }
+        }
+
+        res.json({ prev, next });
+      } catch (err) {
+        console.error("GET /api/nav/verse error:", err);
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // Fallback 404 to return JSON
     app.use((req, res) => {
       res.status(404).json({ error: "Not Found", path: req.path });
     });
 
     // start server
     app.listen(PORT, () => {
-      console.log(`Eden Bible API running on http://localhost:${PORT || "PORT env"}`);
+      console.log(`Eden Bible API running on http://localhost:${PORT}`);
     });
 
   } catch (err) {
